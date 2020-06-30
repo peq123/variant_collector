@@ -1072,14 +1072,14 @@ class gene:
 
         if self.ensembl_id == "" or self.entrez_id == "" or self.symbol == "":
             logger.warn(
-                "Some of the identifying information has not been provided, use .get_information() to retrieve full identification from HGNC API"
+                "Some of the identifying information has not been provided, use .get_identification() to retrieve full identification from HGNC API"
             )
 
         # here get the entrez summary for the gene. this will retrieve the location historys so we can work out the coordinate differences between default_assemblies
         return
 
     def __str__(self):
-        return "Stored information for this gene\nName:\t\t{0} \nEnsembl:\t{1}\nOMIM:\t\t{2}\Entrez:\t\t{3}\n".format(
+        return "Stored information for this gene\nName:\t\t{0} \nEnsembl:\t{1}\nOMIM:\t\t{2}\nEntrez:\t\t{3}\n".format(
             self.symbol, self.ensembl_id, self.omim_id, self.entrez_id)
 
     def get_identification(self):
