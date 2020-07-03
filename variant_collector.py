@@ -154,7 +154,6 @@ class api:
             data={
                 "names": [["grch38", "hg38"], ["grch37", "hg19", "hg37"]],
                 "is_active": [True, False],
-                "is_default": [True, True],
             },
         )
 
@@ -1268,34 +1267,29 @@ class gene:
 
         source = self.check_variant_source(source)
 
-        if parser is None:
-            raise logger.warn(
-                "The hgvs package is missing. Please download from https://github.com/biocommons/hgvs/ and install. Merging variants is disabled without it"
-            )
+        source = source[0]
 
-        if parser is not None or len(self.__variantsources) == 0:
-            # if the hgvs package is not installed, only allow the load if __variantsources is empty.
-            # this doesn't prevent the user from loading in the variants outside of the script.
-            source = source[0]
+        for k, cur_api in self.__api.items():
+            # if api has correct function
+            if callable(
+                    getattr(cur_api, "get_variants", None)
+            ) and k.lower in source and not k.lower() in self.__variantsources:
+                # first remove all labels in dataframe that match this key
+                # remove all columns with prefix of ensembl_
+                #self.__variants = self.__remove_common_labels(self.__variants,
+                #                                              "{0}_".format(
+                #                                                  k.lower()),
+                #                                              axis=1)
+                # now add the merge the new data
 
-            for k, cur_api in self.__api.items():
-                # if api has correct function
-                if cur_api.get_variants is not None and k.lower in source:
-                    # first remove all labels in dataframe that match this key
-                    # remove all columns with prefix of ensembl_
-                    self.__variants = self.__remove_common_labels(
-                        self.__variants, "{0}_".format(k.lower()), axis=1)
-                    # now add the merge the new data
-                    if parser is not None:
+                #self.__variants = self.__variants.merge(
+                #        cur_api.get_variants(self),
+                #        left_index=True,
+                #        right_index=True,
+                #        how="outer")
 
-                        self.__variants = self.__variants.merge(
-                            cur_api.get_variants(self),
-                            left_index=True,
-                            right_index=True,
-                            how="outer")
-
-                    self.__variantsources.append(k.lower())
-            #  validate the source list
+                self.__variantsources.append(k.lower())
+        #  validate the source list
 
         return self.__variants.copy()
 
