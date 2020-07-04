@@ -22,12 +22,14 @@ import sys
 import time
 import requests  # for web calls
 import urllib  # for url encoding
-import cgi  # for escaping > <
+import html  # for escaping > <
 import re  # regex
 import logging
 import json
 import pandas as pd
 import math
+
+from datetime import datetime
 
 import urllib  # for url encoding
 if sys.version_info[0] < 3:
@@ -44,6 +46,8 @@ logger.setLevel(logging.WARNING)
 
 # base api class
 
+active_assembly = "GRCh38"
+
 
 class api:
 
@@ -56,12 +60,18 @@ class api:
         raise Exception("This class can not have instances")
 
     @classmethod
-    def access(cls, url, isjson=True, timeout=1000, headers=None):
+    def access(cls, url, isjson=True, timeout=1000, headers=None, data=None):
         """ call url and retrieve json """
         try:
             if headers is None:
                 headers = {}
-            r = requests.get(url, timeout=timeout, headers=headers)
+            if data is None:
+                r = requests.get(url, timeout=timeout, headers=headers)
+            else:
+                r = requests.post(url,
+                                  timeout=timeout,
+                                  headers=headers,
+                                  data=data)
         except:
             if isjson:
                 return {}
@@ -98,15 +108,17 @@ class api:
             return "{0}{1}{2}".format(prefix, thedict, suffix)
 
     @classmethod
-    def genomic_coordinates(cls,
-                            assembly,
-                            chromosome,
-                            start,
-                            stop,
-                            ref="",
-                            alt="",
-                            returntype=str):
+    def format_genomic_coordinates(cls, position, variance="", returntype=str):
         """ Returns hex encoded string to be used as dataframe index. Will translate to used reference assembly using liftover """
+
+        if type(position) is not dict:
+            raise Exception(
+                "Function expects position as a dictionary, with at least one entry that has the assembly as the key"
+            )
+
+        # cycle through the keys of positon and find the latest assembly
+
+        return "test"
 
         testforassembly = cls.assembly_index(assembly)[0]
         if testforassembly is None:
@@ -151,10 +163,7 @@ class api:
     def __default_assemblies(cls):
         return pd.DataFrame(
             index=["GRCh38", "GRCh37"],
-            data={
-                "names": [["grch38", "hg38"], ["grch37", "hg19", "hg37"]],
-                "is_active": [True, False],
-            },
+            data={"names": [["grch38", "hg38"], ["grch37", "hg19", "hg37"]]},
         )
 
     @classmethod
@@ -165,6 +174,14 @@ class api:
             cls.__assemblies = cls.__default_assemblies()
 
         return cls.__assemblies
+
+    @classmethod
+    def get_active_assembly(cls):
+
+        df = cls.get_assemblies()
+        """ Retrieves the active assembly """
+        return df[df["names"].apply(
+            lambda x: active_assembly.lower() in [i.lower() for i in x])]
 
     @classmethod
     def add_assembly(cls, index, names, is_active=False):
@@ -184,7 +201,7 @@ class api:
 
         # placeholder for future use
         if is_active:
-            print(
+            logging.warn(
                 "Setting current assembly is currently not supported and is a placeholder for future functionality."
             )
 
@@ -235,14 +252,15 @@ class api:
         """ returns the actual key for the provided index if the assembly exists """
         if type(cls.__assemblies) is not pd.DataFrame:
             cls.__assemblies = cls.__default_assemblies()
-        # first get the default assemblies and check that the index is NOT on of those
-        indexdict = {i.lower(): i for i in cls.__assemblies.index}
+        # first attempt to find the index
+        possibles = cls.__assemblies[cls.__assemblies["names"].apply(
+            lambda x: index.lower() in [i.lower() for i in x])]
+
         # dataframe indices are case sensitive, create dictionary of indices with the lowercase as keys
-        if index.lower() in indexdict:
-            return (
-                indexdict[index.lower()],
-                cls.__assemblies["is_default"].loc[indexdict[index.lower()]],
-            )
+        if len(possibles.index) > 0:
+            return (possibles.index[0].lower(),
+                    active_assembly in cls.__assemblies.loc[possibles.index[0],
+                                                            "names"])
         else:
             return default, False
 
@@ -282,16 +300,32 @@ class api:
             cls.__aggregate_frame).reset_index(drop=True))
 
     @classmethod
-    def variant_coordinates(cls, value):
-        """ Returns the coordinates form the supplied value. """
+    def extract_hgvsc(cls, df, fromname, prefix=""):
+        return df
+        """ Updates the dataframe to have a "change" column and an "change_issue" column extracted from the provided column  """
         # this removes the reference transcript from the beginning and any ammino acid labels
 
-        if type(value) is not str:
-            raise Exception("String expected for value.")
-        try:
-            return cgi.escape(re.search("(c.)([^\s]*)", value)[0])
-        except:
-            return value
+        if type(df) is not pd.DataFrame:
+            raise Exception("Function expects the 'df' as a pandas DataFrame.")
+
+        if type(fromname) is not str:
+            raise Exception(
+                "Function expects the 'fromname' column name as a string.")
+
+        if type(prefix) is not str:
+            prefix = ""
+
+        if not prefix == "" and not prefix[-1] == "_":
+            prefix = prefix + "_"  # add underscore to the end
+
+        df["{0}change".format(prefix)] = df.apply(
+            lambda x: html.unescape(re.search("c.[^\s]*", x[fromname])[0])
+            if ":c." in x[fromname] else "[" + x[fromname] + "]",
+            axis=1)
+        df["{0}valid_variant".format(prefix)] = df.apply(lambda x: re.search(
+            "[\[|\]|?|=|,]", x["{0}change".format(prefix)]) is None,
+                                                         axis=1)
+        return df
 
     @classmethod
     def load_path(cls, path):
@@ -503,21 +537,12 @@ class Ensembl(api):
     def get_transcripts(cls, thisgene):
         """ Retrieves list of transcripts + exons from Ensembl """
         if type(thisgene) is not gene:
-            if type(thisgene) is not str or thisgene == "":
-                raise Exception("Valid Ensembl id required.")
-            else:
-                id = thisgene
-        elif type(thisgene) is gene:
-            if type(thisgene.ensembl_id) is not str or str(
-                    thisgene.ensembl_id) == "":
-                raise Exception(
-                    "Function expects 'gene' object  with a valid Ensembl ID.")
-            else:
-                id = thisgene.ensembl_id
+            raise Exception("Function expects gene object")
+
         logger.info("Ensembl: Requesting overlap for transcripts and exons")
         results = cls.access(
             "https://rest.ensembl.org/overlap/id/{0}?feature=transcript;feature=exon;content-type=application/json"
-            .format(id))
+            .format(thisgene.ensembl_id))
 
         # transcripts = {
         #    i["id"]: transcript(i, "ensembl") for i in results if i["Parent"] == id
@@ -526,29 +551,27 @@ class Ensembl(api):
         logger.info("Ensembl: Parsing data")
         datalist = [
             cls.rename_keys(i, prefix="ensembl_") for i in results
-            if i["Parent"] == id
+            if i["Parent"] == thisgene.ensembl_id
         ]
+
+        for t in datalist:
+            t["ensembl_exons"] = {
+                i["id"]: i
+                for i in results if i["Parent"] == t
+            }
 
         # index is set to the genomic coordinates
         transcripts = pd.DataFrame(
             data=datalist,
-            index=[
-                cls.genomic_coordinates(
-                    i["ensembl_assembly_name"],
-                    i["ensembl_seq_region_name"],
-                    i["ensembl_start"],
-                    i["ensembl_end"],
-                ) for i in datalist
-            ],
+            #index=[
+            #    cls.genomic_coordinates({i["ensembl_assembly_name"]: "{0}:{1}:{2}".format(i["ensembl_seq_region_name"],                    i["ensembl_start"],                    i["ensembl_end"])}
+            #    ) for i in datalist
+            #],
         )
 
         # extract out any transcripts that are not referenced to current assembly!
         # liftoverneeded  = transcripts.drop(transcripts["ensembl_assembly_name"].str.contains("")
 
-        # exons = {}
-        # for t in transcripts:
-        #    t["exons"] = {i["id"]: exon(i, "ensembl") for i in results if i["Parent"] == k}
-        # print(len(exons_for_201))
         logger.info("Ensembl: Complete")
         return transcripts
 
@@ -620,9 +643,14 @@ class Entrez(api):
         # do some simple checking
         id = cls.check_ids(id)
 
-        return cls.access(
+        result = cls.access(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db={0}&retmode=json&id={1}"
-            .format(db, id))["result"]
+            .format(db, id))
+        try:
+            return result["result"]
+        except:
+            print(result)
+            raise Exception("")
 
     @classmethod
     def efetch(cls, db, id, retmode=None, rettype=None):
@@ -641,11 +669,9 @@ class Entrez(api):
     def get_transcripts(cls, thisgene):
         """ Provide the Entrez gene id to retrieve RefSeq sequences """
         if type(thisgene) is not gene:
-            id = thisgene
-        elif type(thisgene) is gene:
-            id = thisgene.entrez_id
+            raise Exception("Function expects gene object")
 
-        cls.check_id(id)
+        cls.check_id(thisgene.entrez_id)
 
         # get any ids that the search could be canonical
 
@@ -659,7 +685,7 @@ class Entrez(api):
         # first get the transcript link from the gene
         result = cls.access(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?dbfrom=gene&retmode=json&id={0}&linkname=gene_nuccore_refseqrna"
-            .format(id))
+            .format(thisgene.entrez_id))
 
         # retrieve the links
         if "ERROR" in result:
@@ -681,6 +707,7 @@ class Entrez(api):
 
         for i in range(0, len(links), cls.retrieval_limit):
             data = cls.esummary("nuccore", links[i:i + cls.retrieval_limit])
+
             # we have data from entrez, now extract
             tdata.update({i: data[i]
                           for i in data["uids"]
@@ -699,20 +726,23 @@ class Entrez(api):
         for acc in accessions:
             if not "KEYWORDS" in acc:
                 continue
-            accession = acc.split(
-                "\n")[0].strip()  # the accession in on the first line
-            keywords = acc.split("KEYWORDS")[1].split("\n")[0]
-            if "RefSeq Select" in keywords or "MANE Select" in keywords:
-                # found canoncial
-                if accession not in tdata:
-                    raise Exception(
-                        "Expected {0} in list of transcripts".format(
-                            accession))
-                tdata[accession]["canonical"] = True
-                break
+            accession = re.search("NM_[\d]*",
+                                  acc.split("\n")[0].strip())[
+                                      0]  # the accession in on the first line
+            if accession is not None:
+                keywords = acc.split("KEYWORDS")[1].split("\n")[0]
+                if "RefSeq Select" in keywords or "MANE Select" in keywords:
+                    # found canoncial
+                    if accession not in tdata:
+                        raise Exception(
+                            "Expected {0} in list of transcripts".format(
+                                accession))
+                    tdata[accession]["canonical"] = True
+                    break
 
         # retrieve the gene table for the gene to extract the genomic coordinates for transcripts / exons
-        result = cls.efetch("gene", id, "text", "gene_table").split("\n")
+        result = cls.efetch("gene", thisgene.entrez_id, "text",
+                            "gene_table").split("\n")
         assembly = ""
         assemblies = cls.get_assemblies()
         ctranscript = ""
@@ -866,43 +896,45 @@ class Entrez(api):
 
         # entrez start and end positions depend on the strang
         logger.info("Entrez: Complete")
+
         return pd.DataFrame(
             data=listofdata,
-            index=[
-                cls.genomic_coordinates(
-                    assembly,
-                    i["entrez_subname"].split("|")[0],
-                    i["entrez_start"],
-                    i["entrez_end"],
-                ) for i in listofdata
-            ],
+            #index=[
+            #    cls.genomic_coordinates(
+            #        assembly,
+            #        i["entrez_subname"].split("|")[0],
+            #        i["entrez_start"],
+            #        i["entrez_end"],
+            #    ) for i in listofdata
+            #],
         )
         # return tdata
 
     @classmethod
-    def get_variants(cls, thisgene, search={}):
+    def get_variants(cls, thisgene, search={}, batch=None):
         """ Retrieves clinvar variants for the supplied id """
         if type(thisgene) is not gene:
-            id = thisgene
-        elif type(thisgene) is gene:
-            id = thisgene.entrez_id
+            raise Exception("Function expects gene object")
 
-        cls.check_id(id)
+        cls.check_id(thisgene.entrez_id)
 
-        if batch is None:
+        if type(batch) is not int:
             batch = cls.retrieval_limit
 
-        if type(batch) is not int or batch < 1:
-            raise Exception("Batch size must be an integer > 0.")
+        if batch > 500:
+            logger.info(
+                "Entrez doesn't support batches of more than 500 in json mode."
+            )
+            batch = 500
 
             # first get the link from the gene
 
         logger.info("Entrez: Loading from api")
 
-        logger.info("Retrieving gene to variant links")
+        logger.info("Entrez: Retrieving gene to variant links")
         result = cls.access(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?dbfrom=gene&retmode=json&id={0}&linkname=gene_clinvar"
-            .format(id))
+            .format(thisgene.entrez_id))
 
         # retrieve the links
         if "ERROR" in result:
@@ -913,28 +945,42 @@ class Entrez(api):
             i["links"] for i in result["linksets"][0]["linksetdbs"]
             if i["linkname"] == "gene_clinvar"
         ][0]
-        logger.info("{0} identified".format(len(links)))
+        logger.info("Entrez: {0} links identified".format(len(links)))
         # if there are no results, return back 1
         if len(links) == 0:
             return pd.DataFrame()
 
         return_var = pd.DataFrame()
         printedone = False
-        logger.info("Retrieving summaries in batches of {0} ".format(batch))
+        logger.info(
+            "Entrez: Retrieving summaries in batches of {0} ".format(batch))
+
         for i in range(0, len(links), batch):
+
             data = cls.esummary("clinvar", links[i:i + batch])
 
             pagedf = pd.DataFrame([
                 cls.rename_keys(data[k], prefix="entrez_")
                 for k in data["uids"]
             ])
+
             # for each of the ids returned by entrez, translate the json into a form pandas can understand and then append to the dataframe
             return_var = pd.concat([return_var, pagedf], ignore_index=True)
-            logger.info("Completed {0:.2f}%".format(
+            logger.info("Entrez: Progress {0:.2f}%".format(
                 min((i + 500) / len(links), 1) * 100))
-        logger.info("Entrez variant load complete.")
-        return_var = return_var.rename(
-            index=return_var["entrez_title"].apply(cls.variant_coordinates))
+
+        # extract the change
+        # this is either in the entrez_variantion_set or can use regex to extract from title
+
+        #return_var["entrez_change"] = return_var.apply(lambda x: re.search("c.[^\s]*",x["entrez_title"])[0] if ":c." in x["entrez_title"] else "" ,axis=1)
+
+        return_var = cls.extract_hgvsc(return_var,
+                                       "entrez_title",
+                                       prefix="entrez_")
+
+        logger.info("Entrez: Variant load complete.")
+        #return_var = return_var.rename(
+        #    index=return_var["entrez_title"].apply(cls.variant_coordinates))
         return return_var
 
     @classmethod
@@ -975,50 +1021,134 @@ class LOVD(api):
     @classmethod
     def get_variants(cls, thisgene, raw=False):
         """ If no path is provided, the LOVD api is queried using the recognised gene name (eg BRCA1) and returns a list of associated variants. """
-        symbol = ""
-        if type(thisgene) is str:
-            symbol = thisgene
-        elif type(thisgene) is gene:
-            symbol = thisgene.symbol
+        if type(thisgene) is not gene:
+            raise Exception("Function expects gene object")
 
-        if type(symbol) is not str or symbol == "":
+        if thisgene.symbol == "":
             raise Exception("Valid gene symbol required.")
-        symbol = thisgene
 
         # if path variable has been set, try load from file...if this fails load from api
-
+        logger.info("LOVD: Retrieving data.")
         result = cls.access(
             "https://databases.lovd.nl/shared/api/rest.php/variants/{0}?format=application/json"
-            .format(symbol))
+            .format(thisgene.symbol))
 
         # if there are no results, return back 1
         if len(result) == 0:
             logger.warn("LOVD: No data returned")
             return pd.DataFrame()
 
-        logger.info("LOVD: Parsing Data")
+        logger.info("LOVD: Parsing data.")
         # serveral parameters in this json are lists but don't have more than one value!
         converted = []
+
+        # first get the active assembly
+        active_assembly = cls.get_active_assembly()
+
         for var in result:
-            converted.append({
+
+            newvar = {
                 cls.rename_keys(k, prefix="lovd_"):
                 (cls.parse_data(v[0] if type(v) is list and len(v) == 1 else v)
                  )
                 for k, v in var.items()
-            })
+            }
+
+            converted.append(newvar)
+
         if not raw:
+            # go through the dataset and group by id and variant dna
             return_var = cls.combine_duplicates(
                 pd.DataFrame(converted),
                 ["lovd_Variant/DBID", "lovd_Variant/DNA"])
 
-        return_var = return_var.rename(index=return_var["lovd_Variant/DNA"].
-                                       apply(cls.variant_coordinates))
+            # this may lead to one record having multiple positions
+            # the idea is to take the most recently updated.
+            return_var = cls.parse_frame(return_var)
+
+            return_var["lovd_grch37_coordinates"] = ""
+            return_var["lovd_grch38_coordinates"] = ""
+
+            # extract the variant out
+
+            return_var = cls.extract_hgvsc(return_var,
+                                           "lovd_Variant/DNA",
+                                           prefix="lovd_")
+
+            return_var["lovd_variant"] = return_var.apply(lambda x: re.sub(
+                "NM_[\d]*.\d:c.[\d|+|_|\-|(|)]*", "", x["lovd_Variant/DNA"]),
+                                                          axis=1)
+
+            # there maybe issues with the variant in the record...mark issues
+
+            # extract the genomic coordinates
+            for index, record in return_var.iterrows():
+
+                positions = record["lovd_position_genomic"]
+                updates = record["lovd_edited_date"]
+
+                active_assembly_ref = cls.get_active_assembly()
+
+                if type(positions) is not list:
+                    positions = [positions]
+                if type(updates) is not list:
+                    updates = [updates]
+                updates = [
+                    datetime.strptime(x.replace(":", ""), '%Y-%m-%dT%H%M%S%z')
+                    for x in updates
+                ]
+                setdict = {}
+
+                for i, p in enumerate(positions):
+                    for k, v in p.items():
+                        this_asssembly = cls.assembly_index(k)[0]
+                        update = False
+                        conflict = False
+                        if "lovd_conflicting_{0}_coordinates".format(
+                                this_asssembly) not in list(
+                                    return_var.columns):
+                            # this assembly hasn't been seen before, add new column
+                            return_var["lovd_conflicting_{0}_coordinates".
+                                       format(this_asssembly)] = False
+                            return_var["lovd_{0}_coordinates".format(
+                                this_asssembly)] = ""
+
+                        if k not in setdict:
+                            update = True
+                        elif not v == setdict[k]["position"]:
+                            conflict = True
+                            if updates[i] > setdict[k]["lastedit"]:
+                                update = True
+                            # most recent update
+
+                        if "?" in v or v.strip() == "":
+                            conflict = True
+
+                        if conflict:
+                            return_var.at[index,
+                                          "lovd_conflicting_{0}_coordinates".
+                                          format(this_asssembly)] = True
+
+                        if update:
+                            setdict[k] = {
+                                "position": v,
+                                "lastedit": updates[i]
+                            }
+                            return_var.at[index, "lovd_{0}_coordinates".
+                                          format(this_asssembly)] = v
+                            update = False
+
+        else:
+            return_var = pd.DataFrame(converted)
+
+        #return_var = return_var.rename(index=return_var["lovd_Variant/DNA"].
+        #                               apply(cls.variant_coordinates))
 
         # make sure all values are converted out!
         # if the
         #
         logger.info("LOVD: Complete")
-        return cls.parse_frame(return_var)
+        return return_var
 
 
 class gene:
@@ -1168,7 +1298,7 @@ class gene:
                         right_on=n_ccdsid[0],
                         how="outer")
 
-        if "entrez_id" in self.__transcripts:
+        if "entrez_uid" in self.__transcripts:
             validator_versions = VariantValidator.get_transcript_versions(
                 self.symbol)
 
@@ -1276,10 +1406,10 @@ class gene:
             ) and k.lower in source and not k.lower() in self.__variantsources:
                 # first remove all labels in dataframe that match this key
                 # remove all columns with prefix of ensembl_
-                #self.__variants = self.__remove_common_labels(self.__variants,
-                #                                              "{0}_".format(
-                #                                                  k.lower()),
-                #                                              axis=1)
+                self.__variants = self.__remove_common_labels(self.__variants,
+                                                              "{0}_".format(
+                                                                  k.lower()),
+                                                              axis=1)
                 # now add the merge the new data
 
                 #self.__variants = self.__variants.merge(
