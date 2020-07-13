@@ -44,16 +44,20 @@ logger.setLevel(logging.WARNING)
 
 # class for genes
 
+
+class parameters:
+
+    active_assembly = "GRCh38"
+    # this allows the user to store the variants locally for fast loading
+    store_local = True
+
+
 # base api class
-
-active_assembly = "GRCh38"
-
-
 class api:
 
     __assemblies = None
     __name = ""
-    request_history = []
+    request_history = None
     history_limit = 10
 
     def __init__(self, *args):
@@ -62,6 +66,8 @@ class api:
     @classmethod
     def access(cls, url, isjson=True, timeout=1000, headers=None, data=None):
         """ call url and retrieve json """
+        if cls.request_history is None:
+            cls.request_history = []
         try:
             if headers is None:
                 headers = {}
@@ -72,11 +78,15 @@ class api:
                                   timeout=timeout,
                                   headers=headers,
                                   data=data)
-        except:
-            if isjson:
-                return {}
-            else:
-                return ""
+            cls.request_history = [
+                r
+            ] + cls.request_history[0:cls.history_limit - 1]
+        except Exception as ex:
+            cls.request_history = [
+                ex
+            ] + cls.request_history[0:cls.history_limit - 1]
+
+            raise ex
 
         if not r.ok:
             if r.status_code == 500:
@@ -87,14 +97,10 @@ class api:
                 r.raise_for_status()
 
         if isjson:
-            cls.request_history = [
-                r
-            ] + cls.request_history[0:cls.history_limit - 1]
+
             return r.json()
         else:
-            cls.request_history = [
-                r
-            ] + cls.request_history[0:cls.history_limit - 1]
+
             return r.text
 
     @classmethod
@@ -108,56 +114,40 @@ class api:
             return "{0}{1}{2}".format(prefix, thedict, suffix)
 
     @classmethod
-    def format_genomic_coordinates(cls, position, variance="", returntype=str):
+    def genomic_hgvs(cls, cdna_hgvs, genomic_coordinates=None, returntype=str):
         """ Returns hex encoded string to be used as dataframe index. Will translate to used reference assembly using liftover """
 
-        if type(position) is not dict:
+        if type(genomic_coordinates) is not dict:
             raise Exception(
                 "Function expects position as a dictionary, with at least one entry that has the assembly as the key"
             )
 
-        # cycle through the keys of positon and find the latest assembly
+        if type(cdna_hgvs) is not str or cdna_hgvs == "":
+            raise Exception(
+                "Function expects the cDNA HGVS description for the variant")
 
-        return "test"
+        cdna_hgvs = html.unescape(cdna_hgvs)
+        changetype = re.search("(?<=[^\:]\:)[a-zA-Z]", cdna_hgvs)
 
-        testforassembly = cls.assembly_index(assembly)[0]
-        if testforassembly is None:
-            # assembly not provided so add the current one. this assumes that the coordinates are referenced to the same assembly.
-            testforassembly = list(
-                cls.__assemblies.query("is_active==True"))[0]
-            print(testforassembly)  # this should only contain one item
+        if changetype is None or changetype[0].lower() not in ["c", "g"]:
+            return cdna_hgvs  # fail
+        needs_complement = changetype[0].lower() in ["c"]
+        completechange = re.search("(?<=[\d|\)])[a-z|A|C|G|T|>]{3,}",
+                                   cdna_hgvs)
 
-        elif not cls.__assemblies["is_active"].loc[testforassembly]:
-            # this assembly is not the one the code uses for reference, use liftover to translate
-
-            # TODO use liftover to translate the coordinates
-            pass
-        variantdata = ""
-        formed = "{0}:{1}:{2}{3}{4}{5}{6}{7}{8}".format(
-            testforassembly,
-            chromosome,
-            start,
-            ":" if not stop == "" else "",
-            stop,
-            ":" if not ref == "" else "",
-            ref,
-            ":" if not alt == "" else "",
-            alt,
-        )
-        if returntype is bytearray:
-            return hashlib.sha224(formed.encode("utf-8")).hexdigest()
-        elif returntype is str:
-            return formed
+        if needs_complement:
+            # complement
+            completechange = completechange[0].translate(
+                str.maketrans({
+                    'A': 'T',
+                    'C': 'G',
+                    'G': 'C',
+                    'T': 'A'
+                }))
         else:
-            # return the translated coordinates
+            completechange = completechange[0]
 
-            return {
-                "from_assembly": assembly,
-                "to_assembly": testforassembly,
-                "chromomsome": chromosome,
-                "start": start,
-                "stop": stop,
-            }
+        return
 
     @classmethod
     def __default_assemblies(cls):
@@ -177,11 +167,10 @@ class api:
 
     @classmethod
     def get_active_assembly(cls):
-
         df = cls.get_assemblies()
         """ Retrieves the active assembly """
-        return df[df["names"].apply(
-            lambda x: active_assembly.lower() in [i.lower() for i in x])]
+        return df[df["names"].apply(lambda x: parameters.active_assembly.lower(
+        ) in [i.lower() for i in x])]
 
     @classmethod
     def add_assembly(cls, index, names, is_active=False):
@@ -258,11 +247,23 @@ class api:
 
         # dataframe indices are case sensitive, create dictionary of indices with the lowercase as keys
         if len(possibles.index) > 0:
-            return (possibles.index[0].lower(),
-                    active_assembly in cls.__assemblies.loc[possibles.index[0],
-                                                            "names"])
+            return (possibles.index[0].lower(), parameters.active_assembly in
+                    cls.__assemblies.loc[possibles.index[0], "names"])
         else:
             return default, False
+
+    @classmethod
+    def translate_assembly_name(cls, obj):
+
+        if type(obj) is str:
+            return cls.assembly_index(obj)[0]
+        elif type(obj) is list:
+
+            return [cls.assembly_index(i)[0] for i in obj if type(i) is str]
+
+        elif type(obj) is dict:
+
+            return {cls.assembly_index(k)[0]: v for k, v in obj.items()}
 
     @classmethod
     def __aggregate_frame(cls, frame):
@@ -328,7 +329,42 @@ class api:
         return df
 
     @classmethod
+    def save_local(cls, df, datatype=""):
+        """
+        This attempts to load the variants from a local source at the script location under the following directory tree:
+        DIR / RawData / APIname / type
+        There are no checks on this if the user edits these files.
+        """
+        if type(df) is not pd.DataFrame:
+            raise Exception("Function expects a Pandas DataFrame.")
+
+        if type(datatype) is not str:
+            raise Exception("Function expects datatype as a string.")
+
+        directory = "{0}{1}RawData{1}{2}".format(
+            os.path.dirname(os.path.realpath(__file__)), os.path.sep,
+            cls.__name__)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+
+        df.to_csv("{0}{1}{2}.csv".format(directory, os.path.sep, datatype))
+
+    @classmethod
+    def load_local(cls, datatype=""):
+        logger.debug("{0}{1}RawData{1}{2}{1}{3}.csv".format(
+            os.path.dirname(os.path.realpath(__file__)), os.path.sep,
+            cls.__name__, datatype))
+        logger.debug(
+            os.path.exists("{0}{1}RawData{1}{2}{1}{3}.csv".format(
+                os.path.dirname(os.path.realpath(__file__)), os.path.sep,
+                cls.__name__, datatype)))
+        return cls.load_path("{0}{1}RawData{1}{2}{1}{3}.csv".format(
+            os.path.dirname(os.path.realpath(__file__)), os.path.sep,
+            cls.__name__, datatype))
+
+    @classmethod
     def load_path(cls, path):
+
         df = pd.read_csv(
             path, index_col=0)  # load the csv file with index from column 0
         # load the data
@@ -349,8 +385,10 @@ class api:
 
         strver = str(x)
 
+        # extract out [] objects
+
         if strver.startswith('"[') or strver.startswith('"{'):
-            strver = strver.replace('"[', "[")
+            strver = strver[1:]
 
         if strver.endswith(']"') or strver.endswith('}"'):
             strver = strver[0:-1:]
@@ -378,8 +416,10 @@ class api:
             try:
                 return json.loads(strver)
             except Exception as ex:
-                print(len(parts), type(x), "\n", x, "\n", strver)
-                raise Exception(ex)
+                #logger.warn("Issue loading json {0} {1}\t{2}\t{3}".format(len(parts), type(x), x, strver))
+                # just return x
+                return x
+                #raise Exception(ex)
         else:
             return x
 
@@ -513,14 +553,40 @@ class VariantValidator(api):
 
 class Ensembl(api):
 
-    __name = "Ensembl"
+    include_assembly = False
+    default_assembly = ""
+    versions = None
+    apiurl = ""
+
+    @classmethod
+    def __apiurl(cls):
+        # tests the active assembly to determine the url
+        if cls.default_assembly == "":
+            try:
+                results = cls.access(
+                    "https://rest.ensembl.org/info/assembly/homo_sapiens?content-type=application/json"
+                )
+                cls.default_assembly = results["default_coord_system_version"]
+                cls.versions = [
+                    i.lower() for i in results["coord_system_versions"]
+                ]
+            except:
+                logger.warn(
+                    "Ensembl: Error retrieving current assembly version")
+                raise Exception("Error retrieving current assembly version")
+
+        if cls.default_assembly == parameters.active_assembly:
+            return "https://rest.ensembl.org/"
+        elif parameters.active_assembly.lower() in cls.versions:
+            return "https://{0}.rest.ensembl.org/".format(
+                parameters.active_assembly.lower())
 
     @classmethod
     def get_xrefs(cls, id):
         pass
         results = cls.access(
-            "https://rest.ensembl.org/xrefs/id/{0}?content-type=application/json"
-            .format(id))
+            "{0}/xrefs/id/{1}?content-type=application/json".format(
+                cls.__apiurl(), id))
         returninfo = {"symbol": "", "entrez": ""}
 
         # process the information to extract the needed information
@@ -539,10 +605,23 @@ class Ensembl(api):
         if type(thisgene) is not gene:
             raise Exception("Function expects gene object")
 
+        if parameters.store_local:
+            try:
+                # try and load local copy
+
+                return_var = cls.load_local(
+                    str(thisgene.ensembl_id) + "_" +
+                    parameters.active_assembly + "_transcripts")
+                logger.info("Entrez: Transcript dataset loaded from file.")
+                return return_var
+            except Exception as ex:
+                # if that fails retrieve from api
+                pass
+
         logger.info("Ensembl: Requesting overlap for transcripts and exons")
         results = cls.access(
-            "https://rest.ensembl.org/overlap/id/{0}?feature=transcript;feature=exon;content-type=application/json"
-            .format(thisgene.ensembl_id))
+            "{0}overlap/id/{1}?feature=transcript;feature=exon;content-type=application/json"
+            .format(cls.__apiurl(), thisgene.ensembl_id))
 
         # transcripts = {
         #    i["id"]: transcript(i, "ensembl") for i in results if i["Parent"] == id
@@ -557,7 +636,7 @@ class Ensembl(api):
         for t in datalist:
             t["ensembl_exons"] = {
                 i["id"]: i
-                for i in results if i["Parent"] == t
+                for i in results if i["Parent"] == t["ensembl_id"]
             }
 
         # index is set to the genomic coordinates
@@ -573,12 +652,17 @@ class Ensembl(api):
         # liftoverneeded  = transcripts.drop(transcripts["ensembl_assembly_name"].str.contains("")
 
         logger.info("Ensembl: Complete")
+
+        if parameters.store_local:
+            cls.save_local(
+                transcripts,
+                str(thisgene.ensembl_id) + "_" + parameters.active_assembly +
+                "_transcripts")
+
         return transcripts
 
 
 class Entrez(api):
-
-    __name = "Entrez"
     # refseq protein link = gene_protein_refseq
     # refseq trancript link = gene_nuccore_refseqrna
     # clinvar link = gene_clinvar
@@ -587,11 +671,14 @@ class Entrez(api):
     #  can't retrieve an infinite list of ids in 1 go, limit to this number
     retrieval_limit = 500
 
+    # this store the dates of when the different assembly versions were released to work out the exon positions
+    assembly_history = None
+
     def __init__(self):
         raise Exception("This class can not have instances")
 
     @classmethod
-    def search(cls, db, term, blockraise=False):
+    def esearch(cls, db, term, blockraise=False):
 
         result = cls.access(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db={0}&retmode=json&term={1}"
@@ -619,7 +706,7 @@ class Entrez(api):
 
     @classmethod
     def search_and_retrieve(cls, db, term, blockraise=False):
-        links = cls.search(db, term, blockraise)
+        links = cls.esearch(db, term, blockraise)
 
         # if there are no results, return back
         if len(links) == 0:
@@ -666,6 +753,24 @@ class Entrez(api):
         )
 
     @classmethod
+    def elink(cls, dbfrom, id, linkname):
+
+        id = cls.check_id(id)
+        result = cls.access(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?dbfrom={0}&retmode=json&id={1}&linkname={2}"
+            .format(dbfrom, id, linkname))
+
+        # retrieve the links
+        if "ERROR" in result:
+            raise Exception("Entrez link responded with {0}".format(
+                result["ERROR"]))
+
+        return [
+            i["links"] for i in result["linksets"][0]["linksetdbs"]
+            if i["linkname"] == linkname
+        ][0]
+
+    @classmethod
     def get_transcripts(cls, thisgene):
         """ Provide the Entrez gene id to retrieve RefSeq sequences """
         if type(thisgene) is not gene:
@@ -673,72 +778,23 @@ class Entrez(api):
 
         cls.check_id(thisgene.entrez_id)
 
-        # get any ids that the search could be canonical
+        if parameters.store_local:
+            try:
+                # try and load local copy
 
-        # canonical = cls.search(
-        #    "nuccore",
-        #    '("Homo%20sapiens"[Organism])+{0}[gene]+refseq+mane+select'.format(gene),
-        #    True,
-        # )
+                return_var = cls.load_local(
+                    str(thisgene.entrez_id) + "_" +
+                    parameters.active_assembly + "_transcripts")
+                logger.info("Entrez: Transcript dataset loaded from file.")
+                return return_var
+            except Exception as ex:
+                # if that fails retrieve from api
+                pass
 
-        logger.info("Entrez: Retrieving gene links")
-        # first get the transcript link from the gene
-        result = cls.access(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?dbfrom=gene&retmode=json&id={0}&linkname=gene_nuccore_refseqrna"
-            .format(thisgene.entrez_id))
+        if thisgene.location is None:
+            thisgene.load_genomic_location()
 
-        # retrieve the links
-        if "ERROR" in result:
-            raise Exception("Entrez link responded with {0}".format(
-                result["ERROR"]))
-
-        links = [
-            i["links"] for i in result["linksets"][0]["linksetdbs"]
-            if i["linkname"] == "gene_nuccore_refseqrna"
-        ][0]
-
-        # if there are no results, return back
-        if len(links) == 0:
-            return {}
-
-        logger.info("Entrez: Retrieving transcript summaries")
-        # retrieve the transcript summaries from entrez
-        tdata = {}  # collect everything in dictionary for ease
-
-        for i in range(0, len(links), cls.retrieval_limit):
-            data = cls.esummary("nuccore", links[i:i + cls.retrieval_limit])
-
-            # we have data from entrez, now extract
-            tdata.update({i: data[i]
-                          for i in data["uids"]
-                          })  # add the data to the tdata collection
-
-        # convert the dictionary to have the accession number as the key
-        tdata = {v["caption"]: v for k, v in tdata.items()}
-
-        # determine canoncial transcripts.
-        # there are 2 ways to do this: either retrieve the genbank file for each transcript which means return of extra data...or query but with potentially invalid result
-        logger.info("Entrez: Retrieving transcript records")
-        result = cls.efetch("nuccore", list(tdata.keys()), "text", "gb")
-        logger.info("Entrez: Parsing data")
-        accessions = result.split(
-            "ACCESSION")  # split the returned flat file based on accession
-        for acc in accessions:
-            if not "KEYWORDS" in acc:
-                continue
-            accession = re.search("NM_[\d]*",
-                                  acc.split("\n")[0].strip())[
-                                      0]  # the accession in on the first line
-            if accession is not None:
-                keywords = acc.split("KEYWORDS")[1].split("\n")[0]
-                if "RefSeq Select" in keywords or "MANE Select" in keywords:
-                    # found canoncial
-                    if accession not in tdata:
-                        raise Exception(
-                            "Expected {0} in list of transcripts".format(
-                                accession))
-                    tdata[accession]["canonical"] = True
-                    break
+        logger.info("Entrez: Retrieving gene table")
 
         # retrieve the gene table for the gene to extract the genomic coordinates for transcripts / exons
         result = cls.efetch("gene", thisgene.entrez_id, "text",
@@ -748,6 +804,9 @@ class Entrez(api):
         ctranscript = ""
         start = 0
         end = 0
+        ccds = ""
+        tdata = {}
+        links = []
 
         # now process the returned data
         for line in result:
@@ -756,6 +815,9 @@ class Entrez(api):
             if cline == "":
                 continue
 
+            testtranscript = re.search("(?<=RNA)([\s]*N[MR]_[\d]{6,})(.)(\d)",
+                                       cline)
+
             if assembly == "" and "Assembly" in cline:
                 # assembly hasn't been set yet and assembly found in this line
                 for i in assemblies.index:
@@ -763,44 +825,77 @@ class Entrez(api):
                         # assembly found
                         assembly = i
                         break
+
                 if assembly == "":
                     raise Exception("Assembly not found in Entrez gene table")
-            elif "exons," in cline and "RNA" in cline:
+            elif testtranscript is not None:
                 # outlining the next transcript, so cycle the works to find the id
-                words = cline.split(" ")
-                for w in words:
-                    if "_" in w and "." in w:
-                        # found a word with a possible version
 
-                        ctranscript = w.split(
-                            "."
-                        )[0]  # remove the version number...not needed as this is retrieved from summary
-                        if ctranscript not in tdata:
-                            raise Exception(
-                                "{1} matches {0} transcripts linked to gene, expected 1."
-                                .format(len(ptranscript), ctranscript))
+                ctranscript = testtranscript.group(1).strip()
 
-                        # if not set to True above, it won't exist for this record. so set now
-                        if "canonical" not in tdata[ctranscript]:
-                            tdata[ctranscript]["canonical"] = False
+                if ctranscript not in tdata:
+                    tdata[ctranscript] = {}
 
-                        tdata[ctranscript].update({
-                            "ccdsid": "",
-                            "exons": [],
-                            "start": 0,
-                            "end": 0,
-                            "strand": 0
-                        })
-                        ccds = ""  #
-                        break  # information found, break to avoid wasting time
+                tdata[ctranscript].update({
+                    "ccdsid": ccds,
+                    "exons": [],
+                    "start": 0,
+                    "end": 0,
+                    "strand": 0,
+                    "canonical": False
+                })
 
-            elif "protein" in cline and "CCDS" in cline:
-                # appears this transcript results in a protein and has a conensus ID, so retrieve it
-                # again, the version number isn't required
-                #ccds = "CCDS" + cline.split("CCDS")[1]  #.split(".")[0]
-                ccds = re.search("(CCDS[0-9]*.[0-9])", cline)[0]
+                ccds = ""
+                curver = int(testtranscript.group(3).strip())
+                transcripthistory = {}
+                # here we to work out the exons by getting the version of the trancript that is the most recent compared to the major releases of the assembly accession
+                # thisgene.location contains this information
+                for v in range(curver, 0, -1):
+                    searchresults = cls.search_and_retrieve(
+                        "nuccore", "{0}.{1}".format(ctranscript, v))
+                    if not len(searchresults) == 1:
+                        logger.warn(
+                            "Entrez: Expected a single record to be returned by eSearch for {0}.{1}"
+                            .format(ctranscript, v))
+                        raise Exception(
+                            "Expected a single search result for {0}.{1}".
+                            format(ctranscript, v))
+                    vupdate = datetime.strptime(
+                        list(searchresults.values())[0]["updatedate"],
+                        "%Y/%m/%d")
+                    begindate = thisgene.location[
+                        parameters.active_assembly.lower()]["assemblyupdate"]
 
-            else:
+                    transcripthistory.update({
+                        v: {
+                            "from": begindate,
+                            "to": vupdate,
+                            "uid": list(searchresults.keys())[0]
+                        }
+                    })
+                    if v < curver:
+                        transcripthistory[v + 1]["from"] = vupdate
+                    if vupdate <= thisgene.location[parameters.active_assembly.
+                                                    lower()]["assemblyupdate"]:
+                        break
+
+                usever = [
+                    v["uid"] for k, v in transcripthistory.items()
+                    if v["from"] <= thisgene.location[
+                        parameters.active_assembly.lower()]["assemblyupdate"]
+                    or not (v["from"] > thisgene.location[
+                        parameters.active_assembly.lower()]["assemblyupdate"]
+                            and v["to"] > thisgene.location[
+                                parameters.active_assembly.lower()]
+                            ["assemblyupdate"] and not thisgene.location[
+                                parameters.active_assembly.lower()]["recent"])
+                ][0]
+
+                # add to the links to retrieve the rest of the information later
+                links.append(usever)
+
+            elif False and assembly.lower() == parameters.active_assembly:
+                # only use this information if the assembly in the gene table is the same as the active assembly.
 
                 # this tabulated data could be used but not yet
                 tabulated = [
@@ -855,21 +950,12 @@ class Entrez(api):
 
                 if gc[0] > gc[1]:
                     # if the start is higher than the end it indicates that it is on the reverse strang
-                    #    tdata[ctranscript]["exons"].append({
-                    #        "start": gc[1],
-                    #        "end": gc[0]
-                    #    })
                     tdata[ctranscript]["exons"].append({
                         headers[i].replace(" ", "_").strip(): tabulated[i]
                         for i in range(len(headers))
                     })
                     tdata[ctranscript]["strand"] = -1
-                #    tdata[ctranscript]["start"] = gc[1]
-                #    if tdata[ctranscript]["end"] == 0:
-                #        # only update start if it has no value
-                #        tdata[ctranscript]["end"] = gc[0]
                 else:
-
                     tdata[ctranscript]["exons"].append({
                         headers[i].replace(" ", "_").strip(): tabulated[i]
                         for i in range(len(headers))
@@ -882,13 +968,60 @@ class Entrez(api):
 
                 pass
 
-        # make sure the exons are ordered by start
-        #for c, data in tdata.items():
+        # the above gene table contains exon information for the latest assembly only!
+        # more work is required.
+        # first get the transcript link from the gene
+        #links = cls.elink("gene", thisgene.entrez_id,"gene_nuccore_refseqrna")
 
-        #    tdata[c]["exons"] = sorted(data["exons"], key=lambda x: x["start"])
-        # now work out refseq select / mane select
+        # if there are no results, return back
+        if len(links) == 0:
+            return {}
 
-        # all data collected, now prepare dataframe for return
+        logger.info("Entrez: Retrieving transcript summaries")
+        # retrieve the transcript summaries from entrez
+        tdata = {}  # collect everything in dictionary for ease
+
+        for i in range(0, len(links), cls.retrieval_limit):
+            data = cls.esummary("nuccore", links[i:i + cls.retrieval_limit])
+
+            # we have data from entrez, now extract
+            tdata.update({data[i]["caption"]: data[i]
+                          for i in data["uids"]
+                          })  # add the data to the tdata collection
+
+        # determine canoncial transcripts.
+        # there are 2 ways to do this: either retrieve the genbank file for each transcript which means return of extra data...or query but with potentially invalid result
+        logger.info("Entrez: Retrieving transcript records")
+        result = cls.efetch("nuccore", list(tdata.keys()), "text", "gb")
+        logger.info("Entrez: Parsing data")
+        accessions = result.split(
+            "//")  # split the returned flat file into individual records
+        for acc in accessions:
+            if not "KEYWORDS" in acc:
+                # empty record
+                continue
+            accession = re.search("N[MR]_[\d]*",
+                                  acc)  # the accession in on the first line
+            accession = accession[0] if accession is not None else None
+            if accession is None or accession not in tdata:
+                continue
+            accver = re.search("N[MR]_[\d]*\.\d", acc)  # get the version
+            accver = accver[0] if accver is not None else ""
+            ccds = re.search("CCDS[\d]*.\d", acc)
+            ccds = ccds[0] if ccds is not None else ""
+            tdata[accession]["ccdsid"] = ccds
+            #exons = re.findall("(?<=exon)[\s]*[\d]*\.\.[\d]*",acc)
+
+            if "RefSeq Select" in acc or "MANE Select" in acc:
+                # found canoncial
+
+                tdata[accession]["canonical"] = True
+
+            #if len(exons) > 0:
+        #     # has exon data therefore calculate
+        #    for exonrange in exons:
+        #        eparts = re.findall("[\d]*",exonrange)
+        #        # 0 is start 1 is end
 
         listofdata = [
             cls.rename_keys(v, prefix="entrez_") for v in tdata.values()
@@ -897,17 +1030,15 @@ class Entrez(api):
         # entrez start and end positions depend on the strang
         logger.info("Entrez: Complete")
 
-        return pd.DataFrame(
-            data=listofdata,
-            #index=[
-            #    cls.genomic_coordinates(
-            #        assembly,
-            #        i["entrez_subname"].split("|")[0],
-            #        i["entrez_start"],
-            #        i["entrez_end"],
-            #    ) for i in listofdata
-            #],
-        )
+        return_var = pd.DataFrame(data=listofdata)
+
+        if parameters.store_local:
+            cls.save_local(
+                return_var,
+                str(thisgene.entrez_id) + "_" + parameters.active_assembly +
+                "_transcripts")
+
+        return return_var
         # return tdata
 
     @classmethod
@@ -921,6 +1052,22 @@ class Entrez(api):
         if type(batch) is not int:
             batch = cls.retrieval_limit
 
+        # this code attempts to retrieve a local copy of the dataset
+        return_var = None
+
+        if parameters.store_local:
+            try:
+                # try and load local copy
+
+                return_var = cls.load_local(
+                    str(thisgene.entrez_id) + "_variants")
+                logger.info("Entrez: Variant dataset loaded from file.")
+                return return_var
+            except Exception as ex:
+                # if that fails retrieve from api
+                print(ex)
+                pass
+
         if batch > 500:
             logger.info(
                 "Entrez doesn't support batches of more than 500 in json mode."
@@ -932,19 +1079,9 @@ class Entrez(api):
         logger.info("Entrez: Loading from api")
 
         logger.info("Entrez: Retrieving gene to variant links")
-        result = cls.access(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?dbfrom=gene&retmode=json&id={0}&linkname=gene_clinvar"
-            .format(thisgene.entrez_id))
 
-        # retrieve the links
-        if "ERROR" in result:
-            raise Exception("Entrez link responded with {0}".format(
-                result["ERROR"]))
+        links = cls.elink("gene", thisgene.entrez_id, "gene_clinvar")
 
-        links = [
-            i["links"] for i in result["linksets"][0]["linksetdbs"]
-            if i["linkname"] == "gene_clinvar"
-        ][0]
         logger.info("Entrez: {0} links identified".format(len(links)))
         # if there are no results, return back 1
         if len(links) == 0:
@@ -978,7 +1115,10 @@ class Entrez(api):
                                        "entrez_title",
                                        prefix="entrez_")
 
-        logger.info("Entrez: Variant load complete.")
+        if parameters.store_local:
+            cls.save_local(return_var, str(thisgene.entrez_id) + "_variants")
+
+        logger.info("Entrez: Variant dataset load complete.")
         #return_var = return_var.rename(
         #    index=return_var["entrez_title"].apply(cls.variant_coordinates))
         return return_var
@@ -1027,6 +1167,20 @@ class LOVD(api):
         if thisgene.symbol == "":
             raise Exception("Valid gene symbol required.")
 
+        # this code attempts to retrieve a local copy of the dataset
+        return_var = None
+        if parameters.store_local:
+            try:
+                # try and load local copy
+
+                return_var = cls.load_local(str(thisgene.symbol) + "_variants")
+                logger.info("LOVD: Variant dataset loaded from file.")
+                return return_var
+            except Exception as ex:
+                # if that fails retrieve from api
+                logger.debug(ex)
+                pass
+
         # if path variable has been set, try load from file...if this fails load from api
         logger.info("LOVD: Retrieving data.")
         result = cls.access(
@@ -1043,7 +1197,7 @@ class LOVD(api):
         converted = []
 
         # first get the active assembly
-        active_assembly = cls.get_active_assembly()
+        active_assembly_ref = cls.get_active_assembly()
 
         for var in result:
 
@@ -1086,8 +1240,6 @@ class LOVD(api):
 
                 positions = record["lovd_position_genomic"]
                 updates = record["lovd_edited_date"]
-
-                active_assembly_ref = cls.get_active_assembly()
 
                 if type(positions) is not list:
                     positions = [positions]
@@ -1141,13 +1293,16 @@ class LOVD(api):
         else:
             return_var = pd.DataFrame(converted)
 
+        if parameters.store_local:
+            cls.save_local(return_var, str(thisgene.symbol) + "_variants")
+
         #return_var = return_var.rename(index=return_var["lovd_Variant/DNA"].
         #                               apply(cls.variant_coordinates))
 
         # make sure all values are converted out!
         # if the
         #
-        logger.info("LOVD: Complete")
+        logger.info("LOVD: Variant dataset load complete.")
         return return_var
 
 
@@ -1163,7 +1318,10 @@ class gene:
     hgnc_data = None
     hgnc_id = ""
 
+    location = None
+
     __transcripts = pd.DataFrame()
+    __transcript_assembly = ""
     __variants = pd.DataFrame()
     __variantsources = []
 
@@ -1238,34 +1396,95 @@ class gene:
             raise Exception(
                 "Unexpected problem with retrieving identification")
 
-    def location_history(self):
+    def load_genomic_location(self):
         """ Accesses the entrez api to retrieve the genomic history across previous assemblies """
 
-        if (type(self.entrez_id) is not int and
-                not str(self.entrez_id).isnumeric()) or self.entrez_id <= 0:
-            raise Exception("Function requires valid Entrez ID")
+        if (type(self.entrez_id) is not int
+                and not str(self.entrez_id).isnumeric()) or (
+                    type(self.entrez_id) is int and self.entrez_id <= 0):
+            logger.warn(
+                "Gene has incomplete identification, retrieving information now."
+            )
+            self.get_identification()
 
-    def load_transcripts(self, path=None):
+        self.location = {}
+        try:
+            result = Entrez.esummary("gene",
+                                     self.entrez_id)[str(self.entrez_id)]
+        except Exception as ex:
+            logger.warn(ex)
+            raise Exception("The gene with entrez id {0} was not found".format(
+                self.entrez_id))
+        genomicinfo = result["genomicinfo"][0]
+        cur_start = genomicinfo["chrstart"]
+        cur_stop = genomicinfo["chrstop"]
+        cur_acc = genomicinfo["chraccver"].split(".")[0]
+        #cycle through the history of the gene
+        #we don't need to use entrez api for each accession verson as the data contains the last major version number in the returned data
+        #grch38 is the major version designation. The version in this field represents the first version that is denoted by GRCH38, the previous version will be
+        #GRCh37 (the previous major version)
+        #This helpful can reduce the number of searches (api calls) we need to do as the location history list is chronological##
+
+        #
+        #first limit the list to the chromosome history
+
+        chromohistory = [
+            h for h in result["locationhist"]
+            if h["chraccver"].split(".")[0] == cur_acc
+        ]  #
+
+        skiptover = int(chromohistory[0]["assemblyaccver"].split(".")[1])
+
+        recentassembly = ""
+        for i, h in enumerate(chromohistory):
+            thisversion = int(chromohistory[i]["assemblyaccver"].split(".")[1])
+            #get the current chromohistory data
+            if thisversion > skiptover:
+                continue  #
+
+            assemblysearch = Entrez.search_and_retrieve(
+                "assembly", h["assemblyaccver"])
+            if len(assemblysearch) > 1:
+                raise Exception(
+                    "Search for assembly accession {0} returned multiple results "
+                    .format(h["assemblyaccver"]))
+            assemblydata = list(assemblysearch.values())[0]
+
+            aname = assemblydata["assemblyname"].split(".")[
+                0]  # without the patch number
+            assemblies = api.get_assemblies()
+            if aname not in list(assemblies.index):
+                # add this assembly to the list
+                api.add_assembly(aname, [aname])
+
+            self.location.update({
+                aname.lower(): {
+                    "start":
+                    h["chrstart"],
+                    "stop":
+                    h["chrstop"],
+                    "chracc":
+                    h["chraccver"],
+                    "strand":
+                    1 if h["chrstop"] >= h["chrstart"] else -1,
+                    "assemblyversion":
+                    h["assemblyaccver"],
+                    "assemblyupdate":
+                    datetime.strptime(assemblydata["asmreleasedate_refseq"],
+                                      "%Y/%m/%d %H:%M"),
+                    "recent":
+                    i == 0,
+                }
+            })
+
+            #ready the next major release
+            skiptover = int(
+                assemblydata["lastmajorreleaseaccession"].split(".")[1])
+        return self.location
+
+    def load_transcripts(self):
         """ Load the transcripts from Ensembl and Entrez databases, or by from csv that has been previous exported """
         self.__transcripts = pd.DataFrame()
-        if path is not None:
-
-            # user has provided path, attempt to read and load data
-            # TODO check the resulting dataframe to ensure the basic required information is present
-            try:
-                self.__transcripts = pd.read_csv(path, index_col=0)
-                # this assumes that column 0 is the index from a previous saved dataframe. need to check now
-                for index in self.__transcripts.index:
-                    iparts = index.split(":")
-                    # first check does the index have parts
-                    if not len(iparts) == 4:
-                        raise Exception("Unexpected index format")
-
-                return self.__transcripts.copy()
-            except Exception as ex:
-                logger.warn(
-                    "Issue trying to read transcripts from file: {0}".format(
-                        ex))
 
         for k, cur_api in self.__api.items():
 
@@ -1306,6 +1525,7 @@ class gene:
                 "entrez_accessionversion"].apply(lambda x: validator_versions[
                     x.split(".")[0]] if type(x) is str and "." in x else "")
 
+        self.__transcript_assembly = parameters.active_assembly
         return self.__transcripts.copy()
 
     @classmethod
@@ -1338,6 +1558,12 @@ class gene:
                     end=-1,
                     order=-1,
                     reversed=False):
+
+        if not self.__transcript_assembly == parameters.active_assembly:
+            logger.warn(
+                "Active assembly is different to transcript loaded data. Reloading."
+            )
+            self.load_transcripts()
 
         return self.__transcripts.copy()
 
